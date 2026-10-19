@@ -160,6 +160,35 @@ func TestUserErrorLogsMaskModelNames(t *testing.T) {
 
 	assert.Contains(t, userTaskReason, "friendly-model")
 	assert.Equal(t, "No available channel for model provider-secret-model under group private-group (request id: upstream-secret-id)", readTask(common.RoleAdminUser))
+
+	readTaskList := func(role int) (string, model.Properties, int) {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/tasks/self", nil)
+		ctx.Set("id", task.UserId)
+		ctx.Set("role", role)
+		GetUserTask(ctx)
+		var response struct {
+			Data struct {
+				Items []struct {
+					ChannelId  int              `json:"channel_id"`
+					FailReason string           `json:"fail_reason"`
+					Properties model.Properties `json:"properties"`
+				} `json:"items"`
+			} `json:"data"`
+		}
+		require.NoError(t, common.UnmarshalJsonStr(recorder.Body.String(), &response))
+		require.Len(t, response.Data.Items, 1)
+		return response.Data.Items[0].FailReason, response.Data.Items[0].Properties, response.Data.Items[0].ChannelId
+	}
+	userTaskReason, userTaskProperties, userTaskChannelID := readTaskList(common.RoleCommonUser)
+	assert.Contains(t, userTaskReason, "friendly-model")
+	assert.Equal(t, 0, userTaskChannelID)
+	assert.Equal(t, "friendly-model", userTaskProperties.UpstreamModelName)
+	adminTaskReason, adminTaskProperties, adminTaskChannelID := readTaskList(common.RoleAdminUser)
+	assert.Equal(t, task.FailReason, adminTaskReason)
+	assert.Equal(t, 0, adminTaskChannelID)
+	assert.Equal(t, "provider-secret-model", adminTaskProperties.UpstreamModelName)
 }
 
 func TestUserErrorResponsesMaskOnlyModelNames(t *testing.T) {
@@ -190,6 +219,8 @@ func TestUserErrorResponsesMaskOnlyModelNames(t *testing.T) {
 		{"user SSE", "sse", common.RoleCommonUser, 71, true, true},
 		{"admin SSE", "sse", common.RoleAdminUser, 72, true, false},
 		{"user Responses SSE", "responses", common.RoleCommonUser, 71, true, true},
+		{"user direct SSE", "direct-sse", common.RoleCommonUser, 71, true, true},
+		{"admin direct SSE", "direct-sse", common.RoleAdminUser, 72, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			engine := gin.New()
@@ -209,6 +240,9 @@ func TestUserErrorResponsesMaskOnlyModelNames(t *testing.T) {
 				case "responses":
 					helper.SetEventStreamHeaders(c)
 					require.NoError(t, helper.StringData(c, stream))
+				case "direct-sse":
+					helper.SetEventStreamHeaders(c)
+					c.Render(-1, common.CustomEvent{Data: "data: " + raw + "\n\n"})
 				case "split":
 					c.Status(http.StatusServiceUnavailable)
 					split := strings.Index(raw, "secret-model") + 3
@@ -232,7 +266,7 @@ func TestUserErrorResponsesMaskOnlyModelNames(t *testing.T) {
 				assert.Contains(t, body, "provider-secret-model")
 				assert.Contains(t, body, "provider-returned-model")
 			}
-			if tc.mode == "sse" || tc.mode == "responses" {
+			if tc.mode == "sse" || tc.mode == "responses" || tc.mode == "direct-sse" {
 				assert.Equal(t, http.StatusOK, recorder.Code)
 				assert.Contains(t, recorder.Header().Get("Content-Type"), "text/event-stream")
 				assert.True(t, strings.HasPrefix(body, "data: "))
@@ -285,6 +319,8 @@ func TestUserErrorResponsesMaskOnlyModelNames(t *testing.T) {
 	t.Run("public prefix and short names are preserved", func(t *testing.T) {
 		presentation := model.NewUserErrorPresentation(0, "a-public", "a")
 		assert.Equal(t, "failed a-public a-public", presentation.MaskText("failed a a-public"))
+		hyphenated := model.NewUserErrorPresentation(0, "public-model", "gpt-4")
+		assert.Equal(t, "failed public-model. gpt-4.1 gpt-4o gpt-4-mini", hyphenated.MaskText("failed gpt-4. gpt-4.1 gpt-4o gpt-4-mini"))
 	})
 	t.Run("websocket error", func(t *testing.T) {
 		for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser} {

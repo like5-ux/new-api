@@ -725,9 +725,17 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
     }
   }
 
-  const requestModels = new Set(
-    Object.keys(JSON.parse(formData.model_mapping?.trim() || '{}'))
-  )
+  const requestModels = new Set<string>()
+  try {
+    const mapping = JSON.parse(formData.model_mapping?.trim() || '{}')
+    if (mapping && typeof mapping === 'object' && !Array.isArray(mapping)) {
+      for (const requestModel of Object.keys(mapping)) {
+        requestModels.add(requestModel)
+      }
+    }
+  } catch {
+    // The form schema reports invalid mappings before submission.
+  }
   const userModelMapping = Object.fromEntries(
     Object.entries(formData.user_model_mapping ?? {})
       .filter(

@@ -309,8 +309,10 @@ func TaskGetAllUserTask(userId int, startIdx int, num int, queryParams SyncTaskQ
 
 	// 获取数据
 	// Task lists never render the persisted upstream snapshot; the dashboard
-	// loads media through the artifacts endpoint instead.
-	err = query.Omit("channel_id", "data").Order("id desc").Limit(num).Offset(startIdx).Find(&tasks).Error
+	// loads media through the artifacts endpoint instead. Channel ID remains in
+	// the internal row so user-facing model diagnostics can resolve the display
+	// name; tasksToDto removes it from non-admin responses.
+	err = query.Omit("data").Order("id desc").Limit(num).Offset(startIdx).Find(&tasks).Error
 	if err != nil {
 		return nil
 	}

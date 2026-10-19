@@ -47,6 +47,10 @@ import {
   CHANNEL_TYPE_SGLANG,
   CHANNEL_TYPE_VLLM,
 } from '../../constants'
+import {
+  CHANNEL_FORM_DEFAULT_VALUES,
+  transformFormDataToCreatePayload,
+} from '../../lib/channel-form'
 import { channelSchema, type Channel } from '../../types'
 import { ChannelPluginExtensions } from '../channel-plugin-extensions'
 import { ChannelsProvider } from '../channels-provider'
@@ -2975,3 +2979,17 @@ test.each(['new-friendly-model', ''])(
     }
   }
 )
+
+test('invalid legacy model mapping does not throw while building channel settings', () => {
+  const payload = transformFormDataToCreatePayload({
+    ...CHANNEL_FORM_DEFAULT_VALUES,
+    name: 'Invalid legacy mapping',
+    type: 1,
+    key: 'test-key',
+    models: 'public-alias',
+    model_mapping: '{broken',
+    user_model_mapping: { 'public-alias': 'friendly-model' },
+  })
+  const settings = JSON.parse(payload.channel.settings ?? '{}')
+  expect(settings).not.toHaveProperty('user_model_mapping')
+})

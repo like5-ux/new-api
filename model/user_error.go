@@ -61,6 +61,28 @@ func modelNameByte(b byte) bool {
 	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '-' || b == '.'
 }
 
+func hasModelNameContinuationBefore(text string, offset int) bool {
+	if offset == 0 {
+		return false
+	}
+	previous := text[offset-1]
+	if previous != '.' {
+		return modelNameByte(previous)
+	}
+	return offset > 1 && modelNameByte(text[offset-2])
+}
+
+func hasModelNameContinuationAfter(text string, offset int) bool {
+	if offset >= len(text) {
+		return false
+	}
+	next := text[offset]
+	if next != '.' {
+		return modelNameByte(next)
+	}
+	return offset+1 < len(text) && modelNameByte(text[offset+1])
+}
+
 func (p *UserErrorPresentation) MaskText(text string) string {
 	if p == nil || len(p.names) == 0 || text == "" {
 		return text
@@ -73,7 +95,7 @@ func (p *UserErrorPresentation) MaskText(text string) string {
 			if !strings.HasPrefix(text[offset:], name) {
 				continue
 			}
-			if !strings.ContainsAny(name, "-_/.:") && (offset > 0 && modelNameByte(text[offset-1]) || end < len(text) && modelNameByte(text[end])) {
+			if hasModelNameContinuationBefore(text, offset) || hasModelNameContinuationAfter(text, end) {
 				continue
 			}
 			if name == p.requested || name == p.ModelName {
