@@ -7318,6 +7318,9 @@
     "Zhipu": "智譜",
     "Zhipu GLM": "智譜GLM",
     "Zhipu V4": "智譜 V4",
-    "Zoom": "縮放"
+    "Zoom": "縮放",
+    "User-facing Model Name": "使用者顯示模型名稱",
+    "Leave blank to keep original model names": "留空保留原始模型名稱",
+    "When set, the user-facing name replaces upstream and response model names in user logs. Leave blank to keep the original names. Administrators see the original names.": "填寫後，使用者日誌中的上游請求模型與回應模型才顯示為此名稱；留空保留原始名稱。管理員仍查看原始名稱。"
   }
 }

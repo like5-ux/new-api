@@ -95,6 +95,7 @@ export interface ChannelSettings {
 }
 
 export interface ChannelOtherSettings {
+  user_model_mapping?: Record<string, string>
   azure_responses_version?: string
   vertex_key_type?: 'json' | 'api_key'
   vertex_project_id?: string

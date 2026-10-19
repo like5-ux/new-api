@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"time"
@@ -111,10 +112,49 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 	}
 }
 
+func formatUserLog(log *Log) {
+	log.ChannelName = ""
+	var snapshot struct {
+		Upstream string `json:"upstream_model_name"`
+		Response struct {
+			Requested string `json:"requested_model"`
+			Upstream  string `json:"upstream_model"`
+			Returned  string `json:"returned_model"`
+		} `json:"response_model"`
+	}
+	_ = common.UnmarshalJsonStr(log.Other, &snapshot)
+	requested := log.ModelName
+	if snapshot.Response.Requested != "" {
+		requested = snapshot.Response.Requested
+	}
+	presentation := NewUserErrorPresentation(log.ChannelId, requested, snapshot.Upstream, snapshot.Response.Upstream, snapshot.Response.Returned)
+	log.Content = presentation.MaskText(log.Content)
+	log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser, log.ModelName, log.ChannelId)
+	// Error text remains protected, while model diagnostics are controlled
+	// exclusively by the optional user_model_mapping setting above.
+	var other map[string]common.RawMessage
+	if common.UnmarshalJsonStr(log.Other, &other) == nil {
+		changed := false
+		for key, raw := range other {
+			if key == "upstream_model_name" || key == "response_model" {
+				continue
+			}
+			masked := presentation.MaskJSON(raw)
+			if !bytes.Equal(masked, raw) {
+				other[key], changed = masked, true
+			}
+		}
+		if changed {
+			if encoded, err := common.Marshal(other); err == nil {
+				log.Other = string(encoded)
+			}
+		}
+	}
+}
+
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
-		logs[i].ChannelName = ""
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
+		formatUserLog(logs[i])
 	}
 	assignDisplayLogIds(logs, startIdx)
 }
@@ -123,7 +163,7 @@ func formatUserLogs(logs []*Log, startIdx int) {
 // admin_info. Root callers must not pass their results through this formatter.
 func FormatAdminLogs(logs []*Log) {
 	for i := range logs {
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityAdmin)
+		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityAdmin, logs[i].ModelName, logs[i].ChannelId)
 	}
 }
 
@@ -131,17 +171,23 @@ func FormatAdminLogs(logs []*Log) {
 // without removing root-only diagnostics.
 func FormatRootLogs(logs []*Log) {
 	for i := range logs {
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityRoot)
+		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityRoot, logs[i].ModelName, logs[i].ChannelId)
 	}
 }
 
 func GetLogByTokenId(tokenId int) (logs []*Log, err error) {
+	return GetLogByTokenIdForViewer(tokenId, common.RoleCommonUser)
+}
+
+// GetLogByTokenIdForViewer applies the token owner's role to the same log
+// projection so administrator API keys retain the original diagnostics.
+func GetLogByTokenIdForViewer(tokenId int, viewerRole int) (logs []*Log, err error) {
 	order := "id desc"
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		order = clickHouseLogOrder("")
 	}
 	err = LOG_DB.Model(&Log{}).Where("token_id = ?", tokenId).Order(order).Limit(common.MaxRecentItems).Find(&logs).Error
-	formatUserLogs(logs, 0)
+	formatLogsForViewer(logs, 0, viewerRole)
 	return logs, err
 }
 
@@ -581,6 +627,16 @@ func GetAllLogs(filter LogFilter, startIdx int, num int) (logs []*Log, total int
 const logSearchCountLimit = 10000
 
 func GetUserLogs(userId int, filter LogFilter, startIdx int, num int) (logs []*Log, total int64, err error) {
+	return getUserLogs(userId, filter, startIdx, num, common.RoleCommonUser)
+}
+
+// GetUserLogsForViewer keeps administrator self-log views on their original
+// model diagnostics while retaining the user endpoint's pagination contract.
+func GetUserLogsForViewer(userId int, filter LogFilter, startIdx int, num int, viewerRole int) (logs []*Log, total int64, err error) {
+	return getUserLogs(userId, filter, startIdx, num, viewerRole)
+}
+
+func getUserLogs(userId int, filter LogFilter, startIdx int, num int, viewerRole int) (logs []*Log, total int64, err error) {
 	tx, err := filter.apply(LOG_DB.Where("logs.user_id = ?", userId))
 	if err != nil {
 		return nil, 0, err
@@ -600,7 +656,7 @@ func GetUserLogs(userId int, filter LogFilter, startIdx int, num int) (logs []*L
 		return nil, 0, common.NewMessage("Failed to query logs")
 	}
 
-	formatUserLogs(logs, startIdx)
+	formatLogsForViewer(logs, startIdx, viewerRole)
 	return logs, total, err
 }
 
@@ -628,7 +684,7 @@ func StreamAllLogs(ctx context.Context, filter LogFilter, role int, fn func(*Log
 			}
 			log.ChannelName = name
 		}
-		log.Other = formatLogOtherJSON(log.Other, visibility)
+		log.Other = formatLogOtherJSON(log.Other, visibility, log.ModelName, log.ChannelId)
 		return fn(log)
 	})
 }
@@ -636,6 +692,12 @@ func StreamAllLogs(ctx context.Context, filter LogFilter, role int, fn func(*Log
 // StreamUserLogs is StreamAllLogs for one user's own logs, shaped like the
 // user log list.
 func StreamUserLogs(ctx context.Context, userId int, filter LogFilter, fn func(*Log) error) error {
+	return StreamUserLogsForViewer(ctx, userId, filter, common.RoleCommonUser, fn)
+}
+
+// StreamUserLogsForViewer applies the administrator boundary to self-log
+// exports without changing the stored rows.
+func StreamUserLogsForViewer(ctx context.Context, userId int, filter LogFilter, viewerRole int, fn func(*Log) error) error {
 	tx, err := filter.apply(LOG_DB.WithContext(ctx).Where("logs.user_id = ?", userId))
 	if err != nil {
 		return err
@@ -644,10 +706,33 @@ func StreamUserLogs(ctx context.Context, userId int, filter LogFilter, fn func(*
 	return streamLogs(tx, "logs.id desc", func(log *Log) error {
 		count++
 		log.Id = count
-		log.ChannelName = ""
-		log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+		formatLogForViewer(log, viewerRole)
 		return fn(log)
 	})
+}
+
+func formatLogsForViewer(logs []*Log, startIdx int, viewerRole int) {
+	if viewerRole < common.RoleAdminUser {
+		formatUserLogs(logs, startIdx)
+		return
+	}
+	for i := range logs {
+		formatLogForViewer(logs[i], viewerRole)
+	}
+	assignDisplayLogIds(logs, startIdx)
+}
+
+func formatLogForViewer(log *Log, viewerRole int) {
+	if viewerRole < common.RoleAdminUser {
+		formatUserLog(log)
+		return
+	}
+	log.ChannelName = ""
+	visibility := logOtherVisibilityAdmin
+	if viewerRole >= common.RoleRootUser {
+		visibility = logOtherVisibilityRoot
+	}
+	log.Other = formatLogOtherJSON(log.Other, visibility, log.ModelName, log.ChannelId)
 }
 
 func streamLogs(tx *gorm.DB, order string, fn func(*Log) error) error {

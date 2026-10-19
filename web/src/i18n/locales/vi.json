@@ -7318,6 +7318,9 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom"
+    "Zoom": "Zoom",
+    "User-facing Model Name": "Tên mô hình hiển thị cho người dùng",
+    "Leave blank to keep original model names": "Để trống để giữ tên mô hình gốc",
+    "When set, the user-facing name replaces upstream and response model names in user logs. Leave blank to keep the original names. Administrators see the original names.": "Khi được đặt, tên hiển thị thay thế tên mô hình thượng nguồn và phản hồi trong nhật ký người dùng. Để trống để giữ tên gốc. Quản trị viên vẫn thấy tên gốc."
   }
 }

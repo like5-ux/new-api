@@ -2493,6 +2493,12 @@ export function ChannelMutateDrawer({
               <ModelMappingEditor
                 value={field.value || ''}
                 onChange={field.onChange}
+                userModelMapping={formValues.user_model_mapping}
+                onUserModelMappingChange={(value) =>
+                  form.setValue('user_model_mapping', value, {
+                    shouldDirty: true,
+                  })
+                }
                 disabled={isSubmitting}
                 sourceModelOptions={currentModelsArray}
                 targetModelOptions={modelOptions.map((option) => option.value)}
@@ -5055,6 +5061,12 @@ export function ChannelMutateDrawer({
               onClose={closeRedirectPanel}
               mappingCount={mappingCount}
               mappingValue={formValues.model_mapping || ''}
+              userModelMapping={formValues.user_model_mapping}
+              onUserModelMappingChange={(value) =>
+                form.setValue('user_model_mapping', value, {
+                  shouldDirty: true,
+                })
+              }
               onMappingChange={handlePanelMappingChange}
               onMappingCommit={handlePanelMappingCommit}
               onBatchAdd={() =>
