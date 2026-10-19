@@ -2933,3 +2933,45 @@ test('AWS interface selection is disabled without sensitive channel write permis
     await screen.findByRole('combobox', { name: 'AWS API' })
   ).toBeDisabled()
 })
+
+test.each(['new-friendly-model', ''])(
+  'editing a channel saves optional user display name %j independently from routing',
+  async (nextDisplayName) => {
+    editingChannel.model_mapping = '{"custom-model":"provider-model"}'
+    editingChannel.settings = JSON.stringify({
+      user_model_mapping: { 'custom-model': 'friendly-model' },
+      unrelated_setting: 'preserved',
+    })
+    const put = vi
+      .spyOn(api, 'put')
+      .mockResolvedValue({ data: { success: true } })
+    const user = userEvent.setup()
+    render(<ConfigurationHarness currentRow={editingChannel} />)
+    await screen.findByDisplayValue('Existing channel')
+    await user.click(screen.getByRole('tab', { name: /Routing & Mapping/ }))
+    const displayName = screen.getByRole('textbox', {
+      name: 'User-facing Model Name',
+    })
+    expect(displayName).toHaveValue('friendly-model')
+    await user.clear(displayName)
+    if (nextDisplayName) await user.type(displayName, nextDisplayName)
+    await user.click(screen.getByRole('button', { name: 'Update Channel' }))
+    await waitFor(() => expect(put).toHaveBeenCalled())
+    const payload = put.mock.calls[0]?.[1] as {
+      model_mapping: string
+      settings: string
+    }
+    expect(JSON.parse(payload.model_mapping)).toEqual({
+      'custom-model': 'provider-model',
+    })
+    const settings = JSON.parse(payload.settings)
+    expect(settings.unrelated_setting).toBe('preserved')
+    if (nextDisplayName) {
+      expect(settings.user_model_mapping).toEqual({
+        'custom-model': nextDisplayName,
+      })
+    } else {
+      expect(settings).not.toHaveProperty('user_model_mapping')
+    }
+  }
+)

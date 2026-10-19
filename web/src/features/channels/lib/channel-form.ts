@@ -47,6 +47,8 @@ import { supportsResponsesWebSocket } from './responses-websocket'
 // Form Validation Schema
 // ============================================================================
 
+const userModelMappingSchema = z.record(z.string(), z.string())
+
 const SUPPORTED_PROXY_PROTOCOLS = new Set([
   'http:',
   'https:',
@@ -213,6 +215,7 @@ export const channelFormSchema = z
     openai_organization: z.string().optional(),
     models: z.string().min(1, ERROR_MESSAGES.REQUIRED_MODELS),
     group: z.array(z.string()).min(1, ERROR_MESSAGES.REQUIRED_GROUP),
+    user_model_mapping: userModelMappingSchema.optional(),
     model_mapping: z
       .string()
       .optional()
@@ -440,6 +443,7 @@ export const CHANNEL_FORM_DEFAULT_VALUES: ChannelFormValues = {
   models: '',
   group: ['default'],
   model_mapping: '',
+  user_model_mapping: {},
   priority: 0,
   weight: 0,
   test_model: '',
@@ -565,10 +569,15 @@ export function transformChannelToFormDefaults(
   let upstreamModelUpdateAutoSyncEnabled = false
   let upstreamModelUpdateIgnoredModels = ''
   let advancedCustom = ''
+  let userModelMapping: Record<string, string> = {}
 
   if (channel.settings) {
     try {
       const parsed = JSON.parse(channel.settings)
+      const displayNames = userModelMappingSchema.safeParse(
+        parsed.user_model_mapping
+      )
+      if (displayNames.success) userModelMapping = displayNames.data
       vertexKeyType = parsed.vertex_key_type || 'json'
       vertexProjectId = parsed.vertex_project_id || ''
       azureResponsesVersion = parsed.azure_responses_version || ''
@@ -611,6 +620,7 @@ export function transformChannelToFormDefaults(
     models: channel.models || '',
     group: parseGroups(channel.group || 'default'),
     model_mapping: channel.model_mapping || '',
+    user_model_mapping: userModelMapping,
     priority: channel.priority || 0,
     weight: channel.weight || 0,
     test_model: channel.test_model || '',
@@ -713,6 +723,22 @@ function buildSettingsJSON(formData: ChannelFormValues): string {
       // eslint-disable-next-line no-console
       console.error('Failed to parse existing settings:', error)
     }
+  }
+
+  const requestModels = new Set(
+    Object.keys(JSON.parse(formData.model_mapping?.trim() || '{}'))
+  )
+  const userModelMapping = Object.fromEntries(
+    Object.entries(formData.user_model_mapping ?? {})
+      .filter(
+        ([requested, display]) => requestModels.has(requested) && display.trim()
+      )
+      .map(([requested, display]) => [requested, display.trim()])
+  )
+  if (Object.keys(userModelMapping).length > 0) {
+    settingsObj.user_model_mapping = userModelMapping
+  } else {
+    delete settingsObj.user_model_mapping
   }
 
   // Add vertex_key_type for Vertex AI channels (type 41)

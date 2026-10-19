@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -101,6 +102,11 @@ func TestLogExportDatabaseMatrix(t *testing.T) {
 				t.Skip(tc.env + " is not configured")
 			}
 			db, isolatedDSN := newAuditTestDatabase(t, tc.kind, dsn)
+			if tc.kind == "sqlite" {
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			}
 			mainDB, mainType := db, tc.typ
 			if tc.kind == "clickhouse" {
 				mainDB, _ = newAuditTestDatabase(t, "sqlite", "")
@@ -241,6 +247,271 @@ func TestAcquireLogExportLock(t *testing.T) {
 			require.NoError(t, err)
 			assert.True(t, ok, "a finished export frees the user")
 			releaseAgain()
+		})
+	}
+}
+
+func TestUserLogModelDisplayKeepsOriginalNamesWhenUnconfigured(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, _ := newAuditTestDatabase(t, "sqlite", "")
+	useLogExportDatabases(t, db, db, common.DatabaseTypeSQLite, common.DatabaseTypeSQLite)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	logSetting := operation_setting.GetLogSetting()
+	previousExportEnabled := logSetting.UserExportEnabled
+	logSetting.UserExportEnabled = true
+	t.Cleanup(func() { logSetting.UserExportEnabled = previousExportEnabled })
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		other string
+	}{
+		{
+			name:  "mapped request and response",
+			model: "public-alias",
+			other: `{"is_model_mapped":true,"upstream_model_name":"provider-model","response_model":{"requested_model":"public-alias","upstream_model":"provider-model","returned_model":"provider-response"},"public_id":9007199254740993}`,
+		},
+		{
+			name:  "response request name takes precedence over billing model",
+			model: "billing-model",
+			other: `{"upstream_model_name":"provider-model","response_model":{"requested_model":"public-alias","upstream_model":"provider-model","returned_model":"provider-response"}}`,
+		},
+		{
+			name:  "historical mapping without response observation",
+			model: "public-alias",
+			other: `{"is_model_mapped":true,"upstream_model_name":"provider-model"}`,
+		},
+		{
+			name:  "historical response without requested name",
+			model: "public-alias",
+			other: `{"response_model":{"upstream_model":"provider-model","returned_model":"provider-response"}}`,
+		},
+		{
+			name:  "historical log without requested name stays unchanged",
+			other: `{"upstream_model_name":"provider-model","response_model":{"upstream_model":"provider-model","returned_model":"provider-response"}}`,
+		},
+		{
+			name:  "malformed response metadata stays unchanged",
+			model: "public-alias",
+			other: `{"response_model":"provider-response","public_id":9007199254740993}`,
+		},
+		{
+			name:  "unmapped log stays unchanged",
+			model: "public-alias",
+			other: `{"public_id":9007199254740993}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := model.Log{UserId: 1, CreatedAt: time.Now().Unix(), Type: model.LogTypeConsume, ModelName: tc.model, TokenId: 7, RequestId: tc.name, Other: tc.other}
+			require.NoError(t, db.Create(&log).Error)
+			query := "request_id=" + url.QueryEscape(tc.name)
+
+			listed := callLogHandler(t, GetUserLogs, 1, common.RoleCommonUser, query)[0]
+			require.Equal(t, true, listed["success"])
+			items := listed["data"].(map[string]any)["items"].([]any)
+			require.Len(t, items, 1)
+			assert.JSONEq(t, tc.other, items[0].(map[string]any)["other"].(string))
+
+			exported := callLogHandler(t, ExportUserLogs, 1, common.RoleCommonUser, query)
+			require.Len(t, exported, 2)
+			assert.JSONEq(t, tc.other, exported[0]["other"].(string))
+
+			byKey, err := model.GetLogByTokenId(7)
+			require.NoError(t, err)
+			require.NotEmpty(t, byKey)
+			assert.JSONEq(t, tc.other, byKey[0].Other)
+			if strings.Contains(tc.other, "9007199254740993") {
+				assert.Contains(t, byKey[0].Other, "9007199254740993")
+			}
+
+			for _, role := range []int{common.RoleAdminUser, common.RoleRootUser} {
+				admin := callLogHandler(t, GetAllLogs, 2, role, query)[0]
+				require.Equal(t, true, admin["success"])
+				adminItems := admin["data"].(map[string]any)["items"].([]any)
+				require.Len(t, adminItems, 1)
+				assert.Equal(t, tc.other, adminItems[0].(map[string]any)["other"])
+				adminExport := callLogHandler(t, ExportAllLogs, 2, role, query)
+				require.Len(t, adminExport, 2)
+				assert.Equal(t, tc.other, adminExport[0]["other"])
+			}
+
+			var stored model.Log
+			require.NoError(t, db.First(&stored, log.Id).Error)
+			assert.Equal(t, tc.other, stored.Other)
+		})
+	}
+}
+
+func TestTaskLogModelDisplayKeepsOriginalNamesWhenUnconfigured(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		properties model.Properties
+		expected   string
+	}{
+		{name: "mapped model", properties: model.Properties{OriginModelName: "public-alias", UpstreamModelName: "provider-model"}, expected: "provider-model"},
+		{name: "no upstream model", properties: model.Properties{OriginModelName: "public-alias"}},
+		{name: "historical task without requested name", properties: model.Properties{UpstreamModelName: "provider-model"}, expected: "provider-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &model.Task{TaskID: "model-display", Properties: tc.properties}
+			for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+				view := tasksToDto([]*model.Task{task}, false, role)[0]
+				properties, ok := view.Properties.(model.Properties)
+				require.True(t, ok)
+				assert.Equal(t, tc.properties.OriginModelName, properties.OriginModelName)
+				if role < common.RoleAdminUser {
+					assert.Equal(t, tc.expected, properties.UpstreamModelName)
+				} else {
+					assert.Equal(t, tc.properties.UpstreamModelName, properties.UpstreamModelName)
+				}
+				assert.Equal(t, tc.properties, task.Properties)
+			}
+		})
+	}
+}
+
+func TestUserModelDisplayOverrides(t *testing.T) {
+	for _, database := range []struct {
+		kind, env string
+		typ       common.DatabaseType
+	}{
+		{"sqlite", "", common.DatabaseTypeSQLite},
+		{"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL},
+		{"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL},
+	} {
+		t.Run(database.kind, func(t *testing.T) {
+			dsn := os.Getenv(database.env)
+			if database.env != "" && dsn == "" {
+				t.Skip(database.env + " is not configured")
+			}
+			gin.SetMode(gin.TestMode)
+			versionSQL := "SELECT version()"
+			if database.kind == "sqlite" {
+				versionSQL = "SELECT sqlite_version()"
+			}
+			db, _ := newAuditTestDatabase(t, database.kind, dsn)
+			useLogExportDatabases(t, db, db, database.typ, database.typ)
+			var databaseVersion string
+			require.NoError(t, db.Raw(versionSQL).Scan(&databaseVersion).Error)
+			t.Logf("model display database: %s %s", database.kind, databaseVersion)
+			sqlDB, err := db.DB()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
+			require.NoError(t, db.AutoMigrate(&model.Log{}, &model.Channel{}))
+			invalid := model.Channel{OtherSettings: `{"user_model_mapping":{"alias":42}}`}
+			require.Error(t, invalid.ValidateSettings())
+			settings := `{"user_model_mapping":{"public-alias":"user-visible-model","another-alias":"another-display","blank-alias":"  "}}`
+			channel := model.Channel{Id: 81, Name: "display-test", OtherSettings: settings}
+			require.NoError(t, channel.ValidateSettings())
+			require.NoError(t, db.Create(&channel).Error)
+			channel.SetOtherSettings(channel.GetOtherSettings())
+			require.Contains(t, channel.OtherSettings, "user-visible-model", "typed settings round trips must preserve display names")
+			logSetting := operation_setting.GetLogSetting()
+			previousExportEnabled := logSetting.UserExportEnabled
+			logSetting.UserExportEnabled = true
+			t.Cleanup(func() { logSetting.UserExportEnabled = previousExportEnabled })
+
+			for _, tc := range []struct {
+				name, requested, expected string
+				channelID                 int
+			}{
+				{"configured", "public-alias", "user-visible-model", 81},
+				{"different model", "another-alias", "another-display", 81},
+				{"unconfigured", "unconfigured-alias", "", 81},
+				{"blank name", "blank-alias", "", 81},
+				{"deleted channel", "public-alias", "", 9999},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					other := model.NewLogOther()
+					other.SetPublic("is_model_mapped", true)
+					other.SetPublic("upstream_model_name", "provider-model")
+					other.SetPublic("response_model", map[string]string{"requested_model": tc.requested, "upstream_model": "provider-model", "returned_model": "provider-response"})
+					original := other.JSONString()
+					entry := model.Log{UserId: 1, CreatedAt: time.Now().Unix(), Type: model.LogTypeConsume, ModelName: tc.requested, ChannelId: tc.channelID, TokenId: 91, RequestId: "display-" + tc.name, Content: "provider-model failed: provider-response", Other: original}
+					require.NoError(t, db.Create(&entry).Error)
+					query := "request_id=" + url.QueryEscape(entry.RequestId)
+					expectedUpstream, expectedResponse := "provider-model", "provider-response"
+					expectedContent := tc.requested + " failed: " + tc.requested
+					if tc.expected != "" {
+						expectedUpstream, expectedResponse = tc.expected, tc.expected
+						expectedContent = tc.expected + " failed: " + tc.expected
+					}
+					expected := fmt.Sprintf(`{"is_model_mapped":true,"upstream_model_name":%q,"response_model":{"requested_model":%q,"upstream_model":%q,"returned_model":%q}}`, expectedUpstream, tc.requested, expectedUpstream, expectedResponse)
+					listed := callLogHandler(t, GetUserLogs, 1, common.RoleCommonUser, query)[0]
+					require.Equal(t, true, listed["success"])
+					items := listed["data"].(map[string]any)["items"].([]any)
+					require.Len(t, items, 1)
+					assert.Equal(t, tc.requested, items[0].(map[string]any)["model_name"])
+					assert.JSONEq(t, expected, items[0].(map[string]any)["other"].(string))
+					assert.Equal(t, expectedContent, items[0].(map[string]any)["content"])
+					exported := callLogHandler(t, ExportUserLogs, 1, common.RoleCommonUser, query)
+					require.Len(t, exported, 2)
+					assert.JSONEq(t, expected, exported[0]["other"].(string))
+					assert.Equal(t, expectedContent, exported[0]["content"])
+					tokenLogs, err := model.GetLogByTokenId(91)
+					require.NoError(t, err)
+					require.NotEmpty(t, tokenLogs)
+					assert.JSONEq(t, expected, tokenLogs[0].Other)
+					assert.Equal(t, expectedContent, tokenLogs[0].Content)
+					adminTokenLogs, err := model.GetLogByTokenIdForViewer(91, common.RoleAdminUser)
+					require.NoError(t, err)
+					require.NotEmpty(t, adminTokenLogs)
+					assert.Equal(t, original, adminTokenLogs[0].Other)
+					assert.Equal(t, "provider-model failed: provider-response", adminTokenLogs[0].Content)
+					adminOwn := callLogHandler(t, GetUserLogs, 1, common.RoleAdminUser, query)[0]
+					adminOwnItems := adminOwn["data"].(map[string]any)["items"].([]any)
+					require.Len(t, adminOwnItems, 1)
+					assert.Equal(t, original, adminOwnItems[0].(map[string]any)["other"])
+					assert.Equal(t, "provider-model failed: provider-response", adminOwnItems[0].(map[string]any)["content"])
+					adminOwnExport := callLogHandler(t, ExportUserLogs, 1, common.RoleAdminUser, query)
+					require.Len(t, adminOwnExport, 2)
+					assert.Equal(t, original, adminOwnExport[0]["other"])
+					assert.Equal(t, "provider-model failed: provider-response", adminOwnExport[0]["content"])
+					for _, role := range []int{common.RoleAdminUser, common.RoleRootUser} {
+						admin := callLogHandler(t, GetAllLogs, 2, role, query)[0]
+						adminItems := admin["data"].(map[string]any)["items"].([]any)
+						require.Len(t, adminItems, 1)
+						assert.Equal(t, original, adminItems[0].(map[string]any)["other"])
+						assert.Equal(t, "provider-model failed: provider-response", adminItems[0].(map[string]any)["content"])
+						adminExport := callLogHandler(t, ExportAllLogs, 2, role, query)
+						assert.Equal(t, original, adminExport[0]["other"])
+						assert.Equal(t, "provider-model failed: provider-response", adminExport[0]["content"])
+					}
+					task := &model.Task{TaskID: "display-task", ChannelId: tc.channelID, Properties: model.Properties{OriginModelName: tc.requested, UpstreamModelName: "provider-model"}}
+					for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser, common.RoleRootUser} {
+						view := tasksToDto([]*model.Task{task}, false, role)[0]
+						properties, ok := view.Properties.(model.Properties)
+						require.True(t, ok)
+						assert.Equal(t, tc.requested, properties.OriginModelName)
+						if role < common.RoleAdminUser {
+							assert.Equal(t, expectedUpstream, properties.UpstreamModelName)
+						} else {
+							assert.Equal(t, "provider-model", properties.UpstreamModelName)
+						}
+					}
+					var stored model.Log
+					require.NoError(t, db.First(&stored, entry.Id).Error)
+					assert.Equal(t, original, stored.Other)
+					assert.Equal(t, "provider-model", task.Properties.UpstreamModelName)
+				})
+			}
+			// Editing display settings must also update views of existing logs.
+			require.NoError(t, db.Model(&channel).Update("settings", `{"user_model_mapping":{"public-alias":"updated-display"}}`).Error)
+			logs, _, err := model.GetUserLogs(1, model.LogFilter{RequestId: "display-configured"}, 0, 20)
+			require.NoError(t, err)
+			require.Len(t, logs, 1)
+			assert.Contains(t, logs[0].Other, "updated-display")
+			require.NoError(t, db.Model(&channel).Update("settings", `{}`).Error)
+			restored, _, err := model.GetUserLogs(1, model.LogFilter{RequestId: "display-configured"}, 0, 20)
+			require.NoError(t, err)
+			require.Len(t, restored, 1)
+			var originalLog model.Log
+			require.NoError(t, db.Where("request_id = ?", "display-configured").First(&originalLog).Error)
+			assert.JSONEq(t, originalLog.Other, restored[0].Other, "clearing the display name restores original model diagnostics")
+
 		})
 	}
 }

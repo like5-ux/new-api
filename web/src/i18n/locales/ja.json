@@ -7318,6 +7318,9 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V 4",
-    "Zoom": "ズーム"
+    "Zoom": "ズーム",
+    "User-facing Model Name": "ユーザー向けモデル名",
+    "Leave blank to keep original model names": "空欄の場合は元のモデル名を保持",
+    "When set, the user-facing name replaces upstream and response model names in user logs. Leave blank to keep the original names. Administrators see the original names.": "設定した場合のみ、ユーザーログの上流リクエストモデル名と応答モデル名を置き換えます。空欄の場合は元の名前を保持します。管理者には元の名前が表示されます。"
   }
 }

@@ -7318,6 +7318,9 @@
     "Zhipu": "Zhipu",
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V4",
-    "Zoom": "Zoom"
+    "Zoom": "Zoom",
+    "User-facing Model Name": "Имя модели для пользователей",
+    "Leave blank to keep original model names": "Оставьте пустым, чтобы сохранить исходные имена",
+    "When set, the user-facing name replaces upstream and response model names in user logs. Leave blank to keep the original names. Administrators see the original names.": "Если имя задано, оно заменяет имена модели провайдера и модели ответа в пользовательских журналах. Пустое поле сохраняет исходные имена. Администраторы видят исходные имена."
   }
 }

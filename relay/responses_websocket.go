@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -99,13 +100,14 @@ type responsesWSSession struct {
 	workers        sync.WaitGroup
 	closeOnce      sync.Once
 
-	clientWriteMu sync.Mutex
-	targetWriteMu sync.Mutex
-	connectionMu  sync.Mutex
-	target        *websocket.Conn
-	unregister    func()
-	stateMu       sync.Mutex
-	current       *responsesWSCallState
+	clientWriteMu     sync.Mutex
+	targetWriteMu     sync.Mutex
+	connectionMu      sync.Mutex
+	target            *websocket.Conn
+	unregister        func()
+	stateMu           sync.Mutex
+	current           *responsesWSCallState
+	errorPresentation atomic.Pointer[appmodel.UserErrorPresentation]
 
 	// These fields belong to the serial request worker and describe the actual
 	// established connection. Per-request token/user data is never stored here.
@@ -123,6 +125,7 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: client, runner: runner,
 		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey)}
+	s.errorPresentation.Store(service.NewUserErrorPresentation(c))
 	if s.requestID == "" {
 		s.requestID = common.NewRequestId()
 	}
@@ -182,6 +185,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 	create, parseErr := normalizeResponsesWSCreateEvent(message, envelope, streamID)
 	var apiErr *types.NewAPIError
 	var upstreamURLs []string
+	presentation := appmodel.NewUserErrorPresentation(0, create.Request.Model)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			apiErr = types.NewError(fmt.Errorf("responses websocket request panic: %v", recovered), types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
@@ -197,6 +201,9 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 			if body, err := buildResponsesWSErrorPayload(envelope.EventID, streamID, apiErr, upstreamURLs...); err == nil {
 				outgoing = &responsesWSMessage{kind: websocket.TextMessage, body: body}
 			}
+		}
+		if outgoing != nil {
+			outgoing.body = presentation.PresentJSON(outgoing.body, 0)
 		}
 		s.clientWriteMu.Lock()
 		s.stateMu.Lock()
@@ -220,6 +227,10 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 	request.ContentLength = int64(len(message))
 	request.Header.Set("Content-Type", "application/json")
 	apiErr = s.runner(request, requestID, func(c *gin.Context) *types.NewAPIError {
+		defer func() {
+			presentation = service.NewUserErrorPresentation(c)
+			s.errorPresentation.Store(presentation)
+		}()
 		if parseErr != nil {
 			return newResponsesWSInvalidRequestError(parseErr)
 		}
@@ -248,6 +259,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if info == nil && modelName != "" {
 			info = &relaycommon.RelayInfo{OriginModelName: modelName, UsingGroup: common.GetContextKeyString(c, appconstant.ContextKeyUsingGroup), StartTime: started}
 		}
+		service.SetUserErrorResponseModel(c, info)
 		perfmetrics.RecordRelayResult(c.Request.Context(), info, apiErr)
 		// Settlement already marks the request policy successful, and nothing
 		// reads a termination decision after this point on the WebSocket path,
@@ -400,7 +412,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				info.StreamStatus.RecordError("invalid upstream websocket event")
 			} else {
 				if event.Type != "error" && event.StreamID != "" && event.StreamID != create.StreamID {
-					if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+					if err := s.writeClient(incoming.kind, service.PresentUserErrorJSON(c, incoming.body, 0)); err != nil {
 						s.shutdown(websocket.CloseInternalServerErr, "")
 					}
 					continue
@@ -418,7 +430,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 					}
 					terminal, ambiguous, controlError := responsesWSErrorEndsRequest(rejection, create.StreamID, responseID, sentControl)
 					if !terminal {
-						if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+						if err := s.writeClient(incoming.kind, service.PresentUserErrorJSON(c, incoming.body, 0)); err != nil {
 							s.shutdown(websocket.CloseInternalServerErr, "")
 						}
 						// Only a control error in this stream resolves its pending control.
@@ -478,7 +490,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 				ConsumeResponsesQuota(c, info, accumulator.Finish())
 				return nil
 			}
-			if err := s.writeClient(incoming.kind, incoming.body); err != nil {
+			if err := s.writeClient(incoming.kind, service.PresentUserErrorJSON(c, incoming.body, 0)); err != nil {
 				s.shutdown(websocket.CloseInternalServerErr, "")
 			}
 			if accepted && pendingControl != nil {
@@ -659,7 +671,7 @@ func (s *responsesWSSession) startTargetReader(target *websocket.Conn) {
 				s.shutdown(code, "upstream connection closed")
 				return
 			}
-			if writeErr := s.writeClient(kind, body); writeErr != nil {
+			if writeErr := s.writeClient(kind, s.errorPresentation.Load().PresentJSON(body, 0)); writeErr != nil {
 				s.shutdown(websocket.CloseInternalServerErr, "")
 				return
 			}
@@ -729,7 +741,7 @@ func (s *responsesWSSession) sendError(eventID, streamID string, apiErr *types.N
 	}
 	payload, err := buildResponsesWSErrorPayload(eventID, streamID, apiErr)
 	if err == nil {
-		_ = s.writeClient(websocket.TextMessage, payload)
+		_ = s.writeClient(websocket.TextMessage, s.errorPresentation.Load().PresentJSON(payload, 0))
 	}
 }
 

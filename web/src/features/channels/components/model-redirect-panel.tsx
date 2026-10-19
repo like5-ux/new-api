@@ -38,6 +38,8 @@ type ModelRedirectPanelProps = {
   onClose: () => void
   mappingCount: number
   mappingValue: string
+  userModelMapping?: Record<string, string>
+  onUserModelMappingChange?: (value: Record<string, string>) => void
   onMappingChange: (value: string) => void
   /** Called once an edit settles; the drawer syncs the model list here. */
   onMappingCommit: (value: string) => void
@@ -97,6 +99,8 @@ export function ModelRedirectPanel(props: ModelRedirectPanelProps) {
     >
       <ModelMappingEditor
         value={props.mappingValue}
+        userModelMapping={props.userModelMapping}
+        onUserModelMappingChange={props.onUserModelMappingChange}
         onChange={props.onMappingChange}
         onCommit={props.onMappingCommit}
         onBatchAdd={props.onBatchAdd}

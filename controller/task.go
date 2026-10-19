@@ -54,6 +54,9 @@ func GetTask(c *gin.Context) {
 	if task.Status == model.TaskStatusSuccess && taskFailReasonIsLegacyResultURL(task.FailReason) {
 		failReason = ""
 	}
+	if failReason != "" && service.ResolveUserRole(c) < common.RoleAdminUser {
+		failReason = model.NewUserErrorPresentation(task.ChannelId, task.Properties.OriginModelName, task.Properties.UpstreamModelName).MaskText(failReason)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"task_id":     task.TaskID,
 		"platform":    task.Platform,
@@ -457,6 +460,17 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		item := relay.TaskModel2Dto(task)
+		if viewerRole < common.RoleAdminUser && item.FailReason != "" {
+			item.FailReason = model.NewUserErrorPresentation(task.ChannelId, task.Properties.OriginModelName, task.Properties.UpstreamModelName).MaskText(item.FailReason)
+		}
+
+		if viewerRole < common.RoleAdminUser && task.Properties.UpstreamModelName != "" {
+			if displayName := model.UserModelDisplayName(task.ChannelId, task.Properties.OriginModelName); displayName != "" {
+				properties := task.Properties
+				properties.UpstreamModelName = displayName
+				item.Properties = properties
+			}
+		}
 		item.LegacyVideoAvailable = legacyVideoAvailable(task)
 		item.ResultDiscarded = task.PrivateData.ResultDiscarded
 		if task.Status == model.TaskStatusSuccess {

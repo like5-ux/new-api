@@ -83,7 +83,7 @@ func GetUserLogs(c *gin.Context) {
 		}
 		filter.StartTimestamp = startTimestamp
 	}
-	logs, total, err := model.GetUserLogs(c.GetInt("id"), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	logs, total, err := model.GetUserLogsForViewer(c.GetInt("id"), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), service.ResolveUserRole(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -155,7 +155,7 @@ func exportLogs(c *gin.Context, all bool) {
 	if all {
 		err = model.StreamAllLogs(ctx, filter, c.GetInt("role"), writeLog)
 	} else {
-		err = model.StreamUserLogs(ctx, userId, filter, writeLog)
+		err = model.StreamUserLogsForViewer(ctx, userId, filter, service.ResolveUserRole(c), writeLog)
 	}
 	if ctx.Err() != nil {
 		return
@@ -185,7 +185,7 @@ func GetLogByKey(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgTokenInvalid)
 		return
 	}
-	logs, err := model.GetLogByTokenId(tokenId)
+	logs, err := model.GetLogByTokenIdForViewer(tokenId, service.ResolveUserRole(c))
 	if err != nil {
 		c.JSON(200, gin.H{
 			"success": false,

@@ -7318,6 +7318,9 @@
     "Zhipu": "智谱",
     "Zhipu GLM": "智谱GLM",
     "Zhipu V4": "智谱 V4",
-    "Zoom": "缩放"
+    "Zoom": "缩放",
+    "User-facing Model Name": "用户上游与响应模型名称",
+    "Leave blank to keep original model names": "留空保持原始模型名称",
+    "When set, the user-facing name replaces upstream and response model names in user logs. Leave blank to keep the original names. Administrators see the original names.": "填写后，用户日志中的上游请求模型和响应模型才显示为此名称；留空保留原始名称。管理员仍查看原始名称。"
   }
 }

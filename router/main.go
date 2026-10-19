@@ -15,6 +15,7 @@ import (
 func SetRouter(router *gin.Engine, assets WebAssets) {
 	SetApiRouter(router)
 	SetDashboardRouter(router)
+	router.Use(middleware.UserErrorResponses())
 	SetRelayRouter(router)
 	SetTaskPluginProtocolRouter(router)
 	SetVideoRouter(router)

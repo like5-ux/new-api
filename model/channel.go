@@ -1060,6 +1060,26 @@ func (channel *Channel) SetSetting(setting dto.ChannelSettings) {
 	channel.Setting = common.GetPointer[string](string(settingBytes))
 }
 
+// UserModelDisplayName resolves the optional display name for a request model.
+// An empty result means the original model diagnostics must be preserved.
+func UserModelDisplayName(channelID int, requestedModel string) string {
+	if channelID <= 0 || requestedModel == "" {
+		return ""
+	}
+	channel, err := CacheGetChannel(channelID)
+	if err != nil || channel == nil || channel.OtherSettings == "" {
+		return ""
+	}
+	var settings dto.ChannelOtherSettings
+	if err := common.UnmarshalJsonStr(channel.OtherSettings, &settings); err != nil {
+		return ""
+	}
+	if displayName := strings.TrimSpace(settings.UserModelMapping[requestedModel]); displayName != "" {
+		return displayName
+	}
+	return ""
+}
+
 func (channel *Channel) GetOtherSettings() dto.ChannelOtherSettings {
 	setting := dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {
