@@ -3,9 +3,12 @@ package perfmetrics
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,9 +19,16 @@ import (
 	"github.com/QuantumNous/new-api/setting/perf_metrics_setting"
 
 	"github.com/bytedance/gopkg/util/gopool"
+	"github.com/go-redis/redis/v8"
 )
 
 var hotBuckets sync.Map
+var rollingBuckets sync.Map
+var modelMonitorConfigCache struct {
+	sync.RWMutex
+	raw    string
+	models map[string]struct{}
+}
 
 // seriesSchema is a stable client cache/schema marker. Do not change it when
 // hiding fields or making response-only privacy hardening changes.
@@ -28,6 +38,10 @@ const seriesSchema = "dbcd0a3c01b55203"
 const MaxRecentModels = 50
 const recentSuccessSampleLimit = 24
 const recentSuccessHistoryHours = 7 * 24
+const rollingWindowMinutes = 24 * 60
+const rollingRedisTTL = 25 * time.Hour
+const rollingRedisIndexKey = "perf:rolling:index"
+const rollingRedisQueryTimeout = 10 * time.Second
 
 func Init() {
 	go flushLoop()
@@ -116,15 +130,30 @@ func Record(sample Sample) {
 		sample.LatencyMs = 0
 	}
 
+	now := time.Now()
 	key := bucketKey{
 		model:    sample.Model,
 		group:    sample.Group,
-		bucketTs: bucketStart(time.Now().Unix()),
+		bucketTs: bucketStart(now.Unix()),
 	}
 	actual, _ := hotBuckets.LoadOrStore(key, &atomicBucket{})
 	actual.(*atomicBucket).add(sample)
+
+	monitored := isModelMonitorModel(sample.Model)
+	if monitored {
+		rollingKey := bucketKey{
+			model:    sample.Model,
+			group:    sample.Group,
+			bucketTs: minuteStart(now.Unix()),
+		}
+		rolling, _ := rollingBuckets.LoadOrStore(rollingKey, &atomicBucket{})
+		rolling.(*atomicBucket).add(sample)
+	}
 	gopool.Go(func() {
 		recordRedis(key, sample)
+		if monitored {
+			recordRollingRedis(now, sample)
+		}
 	})
 }
 
@@ -289,6 +318,112 @@ func QuerySummaryAll(hours int, groups []string, recentModels ...string) (Summar
 		}
 	}
 
+	summary, models := summarizeModelTotals(totals)
+	for i := range models {
+		models[i].RecentSuccessSeries = recentSuccessSeries(modelBuckets[models[i].ModelName])
+	}
+
+	return SummaryAllResult{
+		Summary: summary, WindowStart: startTs, WindowEnd: endTs,
+		Models: models, RecentSuccessSeries: recentSeries,
+	}, nil
+}
+
+// QueryRollingSummary aggregates minute-resolution samples for the current
+// process and, when Redis is enabled, all instances that recorded samples in
+// the same rolling window.
+func QueryRollingSummary(minutes int, groups []string, requestedModels ...string) (RollingSummaryResult, error) {
+	return queryRollingSummaryAt(time.Now(), minutes, groups, requestedModels...)
+}
+
+func queryRollingSummaryAt(now time.Time, minutes int, groups []string, requestedModels ...string) (RollingSummaryResult, error) {
+	if minutes <= 0 || minutes > rollingWindowMinutes || len(requestedModels) > MaxRecentModels {
+		return RollingSummaryResult{}, common.NewMessage("Invalid parameters")
+	}
+
+	requested := make(map[string]struct{}, len(requestedModels))
+	for _, name := range requestedModels {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			requested[name] = struct{}{}
+		}
+	}
+	startTs := minuteStart(now.Unix()) - int64(minutes-1)*60
+	endTs := now.Unix()
+	if len(requested) == 0 {
+		return RollingSummaryResult{WindowStart: startTs, WindowEnd: endTs}, nil
+	}
+
+	allowedGroups := allowedGroupSet(groups)
+	totals := make(map[string]counters, len(requested))
+	modelBuckets := make(map[string]map[int64]counters, len(requested))
+
+	if common.RedisEnabled && common.RDB != nil {
+		if err := mergeRollingRedisTotals(startTs, endTs, requested, allowedGroups, totals, modelBuckets); err != nil {
+			return RollingSummaryResult{}, err
+		}
+	} else {
+		rollingBuckets.Range(func(key, value any) bool {
+			k := key.(bucketKey)
+			if k.bucketTs < startTs || k.bucketTs > endTs {
+				return true
+			}
+			if _, ok := requested[k.model]; !ok {
+				return true
+			}
+			if allowedGroups != nil {
+				if _, ok := allowedGroups[k.group]; !ok {
+					return true
+				}
+			}
+			snapshot := value.(*atomicBucket).snapshot()
+			mergeModelTotals(totals, k.model, snapshot)
+			mergeModelBucket(modelBuckets, k.model, k.bucketTs, snapshot)
+			return true
+		})
+	}
+
+	summary, models := summarizeModelTotals(totals)
+	rollingModels := make([]RollingModelSummary, 0, len(models))
+	for _, item := range models {
+		rollingModels = append(rollingModels, RollingModelSummary{
+			ModelSummary: item,
+			SuccessCount: totals[item.ModelName].successCount,
+			Series:       rollingSeries(modelBuckets[item.ModelName]),
+		})
+	}
+	return RollingSummaryResult{
+		Summary: summary, WindowStart: startTs, WindowEnd: endTs, Models: rollingModels,
+	}, nil
+}
+
+func rollingSeries(buckets map[int64]counters) []RollingBucketPoint {
+	if len(buckets) == 0 {
+		return nil
+	}
+	timestamps := make([]int64, 0, len(buckets))
+	for ts, value := range buckets {
+		if value.requestCount > 0 {
+			timestamps = append(timestamps, ts)
+		}
+	}
+	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
+	points := make([]RollingBucketPoint, 0, len(timestamps))
+	for _, ts := range timestamps {
+		value := buckets[ts]
+		points = append(points, RollingBucketPoint{
+			Ts:           ts,
+			RequestCount: value.requestCount,
+			SuccessCount: value.successCount,
+			AvgLatencyMs: avg(value.totalLatencyMs, value.requestCount),
+			SuccessRate:  math.Round(successRate(value)*100) / 100,
+			AvgTps:       math.Round(avgTps(value)*100) / 100,
+		})
+	}
+	return points
+}
+
+func summarizeModelTotals(totals map[string]counters) (*Summary, []ModelSummary) {
 	all := counters{}
 	models := make([]ModelSummary, 0, len(totals))
 	for name, total := range totals {
@@ -307,22 +442,17 @@ func QuerySummaryAll(hours int, groups []string, recentModels ...string) (Summar
 			avgTps = float64(total.outputTokens) / (float64(total.generationMs) / 1000.0)
 		}
 		models = append(models, ModelSummary{
-			ModelName:           name,
-			AvgLatencyMs:        avgLatency,
-			SuccessRate:         math.Round(successRate*100) / 100,
-			AvgTps:              math.Round(avgTps*100) / 100,
-			RecentSuccessSeries: recentSuccessSeries(modelBuckets[name]),
-			RequestCount:        total.requestCount,
+			ModelName:    name,
+			AvgLatencyMs: avgLatency,
+			SuccessRate:  math.Round(successRate*100) / 100,
+			AvgTps:       math.Round(avgTps*100) / 100,
+			RequestCount: total.requestCount,
 		})
 	}
 	sort.Slice(models, func(i, j int) bool {
 		return models[i].RequestCount > models[j].RequestCount
 	})
-
-	return SummaryAllResult{
-		Summary: summarize(all), WindowStart: startTs, WindowEnd: endTs,
-		Models: models, RecentSuccessSeries: recentSeries,
-	}, nil
+	return summarize(all), models
 }
 
 func mergeModelTotals(totals map[string]counters, modelName string, value counters) {
@@ -341,7 +471,7 @@ func mergeModelTotals(totals map[string]counters, modelName string, value counte
 }
 
 func mergeModelBucket(modelBuckets map[string]map[int64]counters, modelName string, bucketTs int64, value counters) {
-	if value.requestCount == 0 {
+	if value == (counters{}) {
 		return
 	}
 	if _, ok := modelBuckets[modelName]; !ok {
@@ -402,6 +532,10 @@ func allowedGroupSet(groups []string) map[string]struct{} {
 		allowed[group] = struct{}{}
 	}
 	return allowed
+}
+
+func minuteStart(ts int64) int64 {
+	return ts - (ts % 60)
 }
 
 func bucketStart(ts int64) int64 {
@@ -547,6 +681,203 @@ func avgTps(value counters) float64 {
 		return 0
 	}
 	return float64(value.outputTokens) / (float64(value.generationMs) / 1000)
+}
+
+func isModelMonitorModel(modelName string) bool {
+	common.OptionMapRWMutex.RLock()
+	raw := common.OptionMap[model.ModelMonitorModelsOptionKey]
+	common.OptionMapRWMutex.RUnlock()
+
+	modelMonitorConfigCache.RLock()
+	if modelMonitorConfigCache.raw == raw {
+		_, ok := modelMonitorConfigCache.models[modelName]
+		modelMonitorConfigCache.RUnlock()
+		return ok
+	}
+	modelMonitorConfigCache.RUnlock()
+
+	models := make(map[string]struct{})
+	if trimmed := strings.TrimSpace(raw); trimmed != "" && trimmed != "null" {
+		var entries []json.RawMessage
+		if err := common.Unmarshal([]byte(raw), &entries); err == nil {
+			for _, entry := range entries {
+				var legacyName string
+				if err := common.Unmarshal(entry, &legacyName); err == nil {
+					if name := strings.TrimSpace(legacyName); name != "" {
+						models[name] = struct{}{}
+					}
+					continue
+				}
+				var configured struct {
+					ModelName string `json:"model_name"`
+				}
+				if err := common.Unmarshal(entry, &configured); err == nil {
+					if name := strings.TrimSpace(configured.ModelName); name != "" {
+						models[name] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
+	modelMonitorConfigCache.Lock()
+	modelMonitorConfigCache.raw = raw
+	modelMonitorConfigCache.models = models
+	modelMonitorConfigCache.Unlock()
+	_, ok := models[modelName]
+	return ok
+}
+
+func rollingRedisField(modelName, group, metric string) string {
+	return strconv.Itoa(len(modelName)) + ":" + modelName + ":" + strconv.Itoa(len(group)) + ":" + group + ":" + metric
+}
+
+func splitRollingRedisField(field string) (modelName, group, metric string, ok bool) {
+	colon := strings.IndexByte(field, ':')
+	if colon <= 0 {
+		return "", "", "", false
+	}
+	modelLength, err := strconv.Atoi(field[:colon])
+	if err != nil || modelLength <= 0 {
+		return "", "", "", false
+	}
+	modelStart := colon + 1
+	modelEnd := modelStart + modelLength
+	if modelEnd >= len(field) || field[modelEnd] != ':' {
+		return "", "", "", false
+	}
+	groupField := field[modelEnd+1:]
+	groupColon := strings.IndexByte(groupField, ':')
+	if groupColon <= 0 {
+		return "", "", "", false
+	}
+	groupLength, err := strconv.Atoi(groupField[:groupColon])
+	if err != nil || groupLength <= 0 {
+		return "", "", "", false
+	}
+	groupStart := groupColon + 1
+	groupEnd := groupStart + groupLength
+	if groupEnd >= len(groupField) || groupField[groupEnd] != ':' {
+		return "", "", "", false
+	}
+	metric = groupField[groupEnd+1:]
+	if metric == "" {
+		return "", "", "", false
+	}
+	return field[modelStart:modelEnd], groupField[groupStart:groupEnd], metric, true
+}
+
+func recordRollingRedis(now time.Time, sample Sample) {
+	if !common.RedisEnabled || common.RDB == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	minuteTs := minuteStart(now.Unix())
+	key := fmt.Sprintf("perf:rolling:%d", minuteTs)
+	pipe := common.RDB.TxPipeline()
+	pipe.ZAdd(ctx, rollingRedisIndexKey, &redis.Z{
+		Score:  float64(minuteTs),
+		Member: strconv.FormatInt(minuteTs, 10),
+	})
+	pipe.Expire(ctx, rollingRedisIndexKey, rollingRedisTTL)
+	pipe.HIncrBy(ctx, key, rollingRedisField(sample.Model, sample.Group, "request"), 1)
+	if sample.Success {
+		pipe.HIncrBy(ctx, key, rollingRedisField(sample.Model, sample.Group, "success"), 1)
+	}
+	if sample.LatencyMs > 0 {
+		pipe.HIncrBy(ctx, key, rollingRedisField(sample.Model, sample.Group, "latency"), sample.LatencyMs)
+	}
+	if sample.OutputTokens > 0 && sample.GenerationMs > 0 {
+		pipe.HIncrBy(ctx, key, rollingRedisField(sample.Model, sample.Group, "tokens"), sample.OutputTokens)
+		pipe.HIncrBy(ctx, key, rollingRedisField(sample.Model, sample.Group, "generation"), sample.GenerationMs)
+	}
+	pipe.Expire(ctx, key, rollingRedisTTL)
+	_, _ = pipe.Exec(ctx)
+}
+
+func mergeRollingRedisTotals(startTs, endTs int64, requested map[string]struct{}, allowedGroups map[string]struct{}, totals map[string]counters, modelBuckets map[string]map[int64]counters) error {
+	ctx, cancel := context.WithTimeout(context.Background(), rollingRedisQueryTimeout)
+	defer cancel()
+
+	members, err := common.RDB.ZRangeByScore(ctx, rollingRedisIndexKey, &redis.ZRangeBy{
+		Min: strconv.FormatInt(startTs, 10),
+		Max: strconv.FormatInt(endTs, 10),
+	}).Result()
+	if err != nil && err != redis.Nil {
+		return err
+	}
+	timestamps := make([]int64, 0, len(members))
+	for _, member := range members {
+		ts, err := strconv.ParseInt(member, 10, 64)
+		if err != nil || ts < startTs || ts > endTs {
+			continue
+		}
+		timestamps = append(timestamps, ts)
+	}
+	if len(timestamps) == 0 {
+		return nil
+	}
+
+	pipe := common.RDB.Pipeline()
+	cmds := make([]*redis.StringStringMapCmd, 0, len(timestamps))
+	for _, ts := range timestamps {
+		cmds = append(cmds, pipe.HGetAll(ctx, fmt.Sprintf("perf:rolling:%d", ts)))
+	}
+	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
+		return err
+	}
+
+	for commandIndex, cmd := range cmds {
+		bucketTs := timestamps[commandIndex]
+		values, err := cmd.Result()
+		if err != nil && err != redis.Nil {
+			return err
+		}
+		for field, raw := range values {
+			modelName, group, metric, ok := splitRollingRedisField(field)
+			if !ok {
+				continue
+			}
+			if _, ok := requested[modelName]; !ok {
+				continue
+			}
+			if allowedGroups != nil {
+				if _, ok := allowedGroups[group]; !ok {
+					continue
+				}
+			}
+			value, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil {
+				continue
+			}
+			total := totals[modelName]
+			var bucketValue counters
+			switch metric {
+			case "request":
+				total.requestCount += value
+				bucketValue.requestCount = value
+			case "success":
+				total.successCount += value
+				bucketValue.successCount = value
+			case "latency":
+				total.totalLatencyMs += value
+				bucketValue.totalLatencyMs = value
+			case "tokens":
+				total.outputTokens += value
+				bucketValue.outputTokens = value
+			case "generation":
+				total.generationMs += value
+				bucketValue.generationMs = value
+			default:
+				continue
+			}
+			totals[modelName] = total
+			mergeModelBucket(modelBuckets, modelName, bucketTs, bucketValue)
+		}
+	}
+	return nil
 }
 
 func recordRedis(key bucketKey, sample Sample) {

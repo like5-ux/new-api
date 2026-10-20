@@ -23,6 +23,8 @@ type Option struct {
 	Value string `json:"value"`
 }
 
+const ModelMonitorModelsOptionKey = "model_monitor_setting.models"
+
 func AllOption() ([]*Option, error) {
 	var options []*Option
 	var err error
@@ -190,6 +192,7 @@ func InitOptionMap() {
 	// 自动添加所有注册的模型配置
 	modelConfigs := config.GlobalConfig.ExportAllConfigs()
 	maps.Copy(common.OptionMap, modelConfigs)
+	common.OptionMap[ModelMonitorModelsOptionKey] = "[]"
 
 	common.OptionMapRWMutex.Unlock()
 	loadOptionsFromDatabase()
