@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -12,6 +13,8 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/go-redis/redis/v8"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -349,4 +352,136 @@ func TestPerformanceAggregationAndFlush(t *testing.T) {
 			})
 		})
 	}
+}
+
+func TestRecordOnlyRetainsRollingBucketsForMonitoredModels(t *testing.T) {
+	hotBuckets.Clear()
+	rollingBuckets.Clear()
+	common.OptionMapRWMutex.Lock()
+	previousOptions := common.OptionMap
+	common.OptionMap = map[string]string{
+		model.ModelMonitorModelsOptionKey: `[{"model_name":"configured-model","description":"primary"},{"model_name":"legacy-model"}]`,
+	}
+	common.OptionMapRWMutex.Unlock()
+	t.Cleanup(func() {
+		hotBuckets.Clear()
+		rollingBuckets.Clear()
+		common.OptionMapRWMutex.Lock()
+		common.OptionMap = previousOptions
+		common.OptionMapRWMutex.Unlock()
+		modelMonitorConfigCache.Lock()
+		modelMonitorConfigCache.raw = ""
+		modelMonitorConfigCache.models = nil
+		modelMonitorConfigCache.Unlock()
+	})
+
+	Record(Sample{Model: "configured-model", Group: "default", Success: true})
+	Record(Sample{Model: "legacy-model", Group: "default"})
+	Record(Sample{Model: "unconfigured-model", Group: "default", Success: true})
+
+	models := map[string]struct{}{}
+	rollingBuckets.Range(func(key, _ any) bool {
+		models[key.(bucketKey).model] = struct{}{}
+		return true
+	})
+	assert.Equal(t, map[string]struct{}{
+		"configured-model": {},
+		"legacy-model":     {},
+	}, models)
+}
+
+func TestRollingSummaryUsesMinuteWindows(t *testing.T) {
+	rollingBuckets.Clear()
+	t.Cleanup(rollingBuckets.Clear)
+
+	now := time.Date(2026, 10, 19, 12, 30, 45, 0, time.Local)
+	addSample := func(modelName, group string, minutesAgo int, success bool, latencyMs, tokens, generationMs int64) {
+		key := bucketKey{model: modelName, group: group, bucketTs: minuteStart(now.Unix()) - int64(minutesAgo)*60}
+		bucket := &atomicBucket{}
+		bucket.add(Sample{Success: success, LatencyMs: latencyMs, OutputTokens: tokens, GenerationMs: generationMs})
+		rollingBuckets.Store(key, bucket)
+	}
+	addSample("model-a", "a", 5, true, 100, 50, 1000)
+	addSample("model-a", "a", 20, false, 100, 0, 0)
+	addSample("model-a", "a", 40, true, 100, 50, 1000)
+	addSample("model-a", "a", 70, true, 100, 0, 0)
+	addSample("model-a", "a", 300, true, 100, 0, 0)
+	addSample("model-a", "a", 700, false, 100, 0, 0)
+	addSample("model-a", "a", 1400, true, 100, 0, 0)
+	addSample("model-a", "inactive", 5, false, 999, 0, 0)
+	addSample("model-b", "a", 5, true, 999, 0, 0)
+
+	for _, tc := range []struct {
+		minutes        int
+		requestCount   int64
+		successRate    float64
+		averageLatency int64
+		averageTps     float64
+	}{
+		{minutes: 60, requestCount: 3, successRate: 66.67, averageLatency: 100, averageTps: 50},
+		{minutes: 360, requestCount: 5, successRate: 80, averageLatency: 100, averageTps: 50},
+		{minutes: 720, requestCount: 6, successRate: 66.67, averageLatency: 100, averageTps: 50},
+		{minutes: 1440, requestCount: 7, successRate: 71.43, averageLatency: 100, averageTps: 50},
+	} {
+		t.Run(strconv.Itoa(tc.minutes), func(t *testing.T) {
+			result, err := queryRollingSummaryAt(now, tc.minutes, []string{"a"}, "model-a")
+			require.NoError(t, err)
+			require.Len(t, result.Models, 1)
+			modelSummary := result.Models[0]
+			assert.Equal(t, "model-a", modelSummary.ModelName)
+			assert.Equal(t, tc.requestCount, modelSummary.RequestCount)
+			assert.Equal(t, tc.successRate, modelSummary.SuccessRate)
+			assert.Equal(t, tc.averageLatency, modelSummary.AvgLatencyMs)
+			assert.Equal(t, tc.averageTps, modelSummary.AvgTps)
+			require.NotNil(t, result.Summary)
+			assert.Equal(t, tc.successRate, result.Summary.SuccessRate)
+		})
+	}
+}
+
+func TestRollingRedisFieldRoundTrip(t *testing.T) {
+	field := rollingRedisField("vendor:model", "group:blue", "request")
+	modelName, group, metric, ok := splitRollingRedisField(field)
+	require.True(t, ok)
+	assert.Equal(t, "vendor:model", modelName)
+	assert.Equal(t, "group:blue", group)
+	assert.Equal(t, "request", metric)
+	_, _, _, ok = splitRollingRedisField("invalid")
+	assert.False(t, ok)
+}
+func TestRollingRedisRoundTrip(t *testing.T) {
+	redisServer := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	previousRedisEnabled, previousRDB := common.RedisEnabled, common.RDB
+	common.RedisEnabled, common.RDB = true, client
+	t.Cleanup(func() {
+		common.RedisEnabled, common.RDB = previousRedisEnabled, previousRDB
+	})
+
+	now := time.Date(2026, 10, 19, 12, 30, 45, 0, time.Local)
+	recordRollingRedis(now, Sample{
+		Model: "vendor:model", Group: "group:blue", Success: false,
+		LatencyMs: 100, OutputTokens: 50, GenerationMs: 1000,
+	})
+	recordRollingRedis(now, Sample{
+		Model: "vendor:model", Group: "group:blue", Success: true,
+		LatencyMs: 100, OutputTokens: 50, GenerationMs: 1000,
+	})
+
+	requested := map[string]struct{}{"vendor:model": {}}
+	totals := map[string]counters{}
+	buckets := map[string]map[int64]counters{}
+	bucketTs := minuteStart(now.Unix())
+	require.NoError(t, mergeRollingRedisTotals(bucketTs, bucketTs, requested, map[string]struct{}{"group:blue": {}}, totals, buckets))
+	assert.Equal(t, counters{
+		requestCount: 2, successCount: 1, totalLatencyMs: 200,
+		outputTokens: 100, generationMs: 2000,
+	}, totals["vendor:model"])
+	assert.Equal(t, totals["vendor:model"], buckets["vendor:model"][bucketTs])
+	series := rollingSeries(buckets["vendor:model"])
+	require.Len(t, series, 1)
+	assert.Equal(t, int64(2), series[0].RequestCount)
+	assert.Equal(t, int64(1), series[0].SuccessCount)
+	assert.Equal(t, 50.0, series[0].SuccessRate)
 }

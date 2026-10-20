@@ -99,6 +99,14 @@ func TestHeaderNavModuleAuthRejectsDisabledPricing(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, recorder.Code)
 }
 
+func TestHeaderNavModuleAuthRejectsDisabledModelMonitor(t *testing.T) {
+	withHeaderNavModules(t, `{"modelMonitor":false}`)
+
+	recorder := performHeaderNavRequest(t, HeaderNavModuleAuth("modelMonitor"), false)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+}
+
 func TestDisabledPricingRequiresRootAuthentication(t *testing.T) {
 	for _, tc := range []struct {
 		name       string

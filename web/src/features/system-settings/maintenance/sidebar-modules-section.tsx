@@ -122,6 +122,10 @@ export function SidebarModulesSection({
         title: t('Task logs'),
         description: t('Background job tracker for queued work.'),
       },
+      monitor: {
+        title: t('Model Monitor'),
+        description: t('Public real-time relay call monitoring.'),
+      },
     },
     personal: {
       topup: {
