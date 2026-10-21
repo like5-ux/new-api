@@ -226,10 +226,55 @@ func normalizeLegacyRejectReason(values map[string]json.RawMessage) bool {
 	return true
 }
 
+// normalizeUserLogModelNames applies user display names to model diagnostics.
+// The stored observation remains available to administrator and root views.
+func normalizeUserLogModelNames(values map[string]json.RawMessage, modelName string, channelID int) bool {
+	var observation map[string]json.RawMessage
+	rawObservation := values["response_model"]
+	validObservation := common.Unmarshal(rawObservation, &observation) == nil && observation != nil
+	if validObservation {
+		var requestedModel string
+		if common.Unmarshal(observation["requested_model"], &requestedModel) == nil && requestedModel != "" {
+			modelName = requestedModel
+		}
+	}
+	displayName := UserModelDisplayName(channelID, modelName)
+	if displayName == "" {
+		return false
+	}
+	encodedModel, err := common.Marshal(displayName)
+	if err != nil {
+		return false
+	}
+	changed := false
+	if _, exists := values["upstream_model_name"]; exists {
+		values["upstream_model_name"] = encodedModel
+		changed = true
+	}
+	if validObservation {
+		observationChanged := false
+		if _, exists := observation["upstream_model"]; exists {
+			observation["upstream_model"] = encodedModel
+			observationChanged = true
+		}
+		if _, exists := observation["returned_model"]; exists {
+			observation["returned_model"] = encodedModel
+			observationChanged = true
+		}
+		if observationChanged {
+			if encodedObservation, err := common.Marshal(observation); err == nil {
+				values["response_model"] = encodedObservation
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
 // formatLogOtherJSON applies the role projection while keeping untouched JSON
 // values as RawMessage. This preserves integers larger than JavaScript's safe
 // range instead of round-tripping them through float64.
-func formatLogOtherJSON(value string, visibility logOtherVisibility) string {
+func formatLogOtherJSON(value string, visibility logOtherVisibility, modelName string, channelID int) string {
 	if value == "" {
 		return ""
 	}
@@ -255,6 +300,9 @@ func formatLogOtherJSON(value string, visibility logOtherVisibility) string {
 				delete(values, key)
 				changed = true
 			}
+		}
+		if normalizeUserLogModelNames(values, modelName, channelID) {
+			changed = true
 		}
 	} else {
 		changed = normalizeLegacyRejectReason(values)

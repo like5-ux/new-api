@@ -34,7 +34,7 @@ import { ComboboxInput } from '@/components/ui/combobox-input'
 import { Input } from '@/components/ui/input'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 
-type MappingField = 'from' | 'to'
+type MappingField = 'from' | 'to' | 'displayName'
 
 /**
  * Asks the editor to open a mapping row for a model the caller already knows
@@ -57,6 +57,8 @@ type ModelMappingEditorProps = {
   value: string
   onChange: (value: string) => void
   disabled?: boolean
+  userModelMapping?: Record<string, string>
+  onUserModelMappingChange?: (value: Record<string, string>) => void
   sourceModelOptions?: string[]
   targetModelOptions?: string[]
   /** Shows the batch button; the caller owns the batch dialog. */
@@ -75,6 +77,7 @@ type MappingRow = {
   id: string
   from: string
   to: string
+  displayName: string
 }
 
 const DUPLICATE_MAPPING_SENTINEL = '{ "duplicate_source_models": '
@@ -172,12 +175,16 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
               id: existing.id,
               from,
               to: toString,
+              displayName:
+                props.userModelMapping?.[from] ??
+                (existing.from === from ? existing.displayName : ''),
             }
           }
           return {
             id: createRowId(),
             from,
             to: toString,
+            displayName: props.userModelMapping?.[from] ?? '',
           }
         })
         // Rows without a request name are not serialized yet; keep them so a
@@ -210,6 +217,21 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
   useEffect(() => {
     syncExternalValue()
   }, [props.value])
+
+  const syncExternalDisplayNames = useEffectEvent(() => {
+    setRows((previous) =>
+      previous.map((row) => ({
+        ...row,
+        displayName: row.from.trim()
+          ? (props.userModelMapping?.[row.from.trim()] ?? '')
+          : row.displayName,
+      }))
+    )
+  })
+
+  useEffect(() => {
+    syncExternalDisplayNames()
+  }, [props.userModelMapping])
 
   // A freshly added row exists one commit after the click, so focus it once
   // its inputs are rendered.
@@ -250,7 +272,12 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
       }
       setRows((previous) => [
         ...previous,
-        { id: rowId, from: request.from, to: request.to },
+        {
+          id: rowId,
+          from: request.from,
+          to: request.to,
+          displayName: props.userModelMapping?.[request.from] ?? '',
+        },
       ])
     }
     props.onDraftRequestHandled?.()
@@ -288,6 +315,20 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
       return
     }
 
+    if (props.onUserModelMappingChange) {
+      const displayNames = Object.fromEntries(
+        updatedRows
+          .filter((row) => row.from.trim() && row.displayName.trim())
+          .map((row) => [row.from.trim(), row.displayName])
+      )
+      if (
+        JSON.stringify(displayNames) !==
+        JSON.stringify(props.userModelMapping ?? {})
+      ) {
+        props.onUserModelMappingChange(displayNames)
+      }
+    }
+
     const json = convertRowsToJson(updatedRows)
     setJsonError(null)
     setJsonValue(json)
@@ -300,6 +341,7 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
       id: createRowId(),
       from: '',
       to: '',
+      displayName: '',
     }
     pendingRowFocusRef.current = { rowId: newRow.id, field: 'from' }
     syncRows([...rows, newRow])
@@ -365,9 +407,14 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
     visibleRows = rows.filter(
       (row) =>
         row.from.toLowerCase().includes(filterKeyword) ||
-        row.to.toLowerCase().includes(filterKeyword)
+        row.to.toLowerCase().includes(filterKeyword) ||
+        row.displayName.toLowerCase().includes(filterKeyword)
     )
   }
+
+  const rowColumns = props.onUserModelMappingChange
+    ? 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto]'
+    : 'grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]'
 
   return (
     <div
@@ -436,7 +483,9 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
         <TabsContent value='visual' className='space-y-2'>
           <p className='text-muted-foreground text-xs'>
             {t(
-              'Users call the model on the left. The platform forwards the request to the upstream model on the right.'
+              props.onUserModelMappingChange
+                ? 'When set, the user-facing name replaces upstream and response model names in user logs. Leave blank to keep the original names. Administrators see the original names.'
+                : 'Users call the model on the left. The platform forwards the request to the upstream model on the right.'
             )}
           </p>
           {rows.length > 0 ? (
@@ -459,16 +508,16 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
                   )}
                 </div>
               )}
-              <div className='grid grid-cols-[1fr_1fr_auto] gap-2 text-sm font-medium'>
+              <div className={`grid ${rowColumns} gap-2 text-sm font-medium`}>
                 <div>{t('Request Model Name')}</div>
                 <div>{t('Upstream Model Name')}</div>
+                {props.onUserModelMappingChange && (
+                  <div>{t('User-facing Model Name')}</div>
+                )}
                 <div className='w-10' />
               </div>
               {visibleRows.map((row) => (
-                <div
-                  key={row.id}
-                  className='grid grid-cols-[1fr_1fr_auto] gap-2'
-                >
+                <div key={row.id} className={`grid ${rowColumns} gap-2`}>
                   <ComboboxInput
                     id={rowInputId(row.id, 'from')}
                     options={sourceOptions}
@@ -495,6 +544,24 @@ export function ModelMappingEditor(props: ModelMappingEditorProps) {
                     disabled={props.disabled}
                     aria-label={t('Upstream Model Name')}
                   />
+                  {props.onUserModelMappingChange && (
+                    <Input
+                      id={rowInputId(row.id, 'displayName')}
+                      aria-label={t('User-facing Model Name')}
+                      value={row.displayName}
+                      onChange={(event) =>
+                        handleRowChange(
+                          row.id,
+                          'displayName',
+                          event.target.value
+                        )
+                      }
+                      placeholder={t(
+                        'Leave blank to keep original model names'
+                      )}
+                      disabled={props.disabled}
+                    />
+                  )}
                   <Button
                     type='button'
                     variant='ghost'

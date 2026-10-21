@@ -54,6 +54,9 @@ func GetTask(c *gin.Context) {
 	if task.Status == model.TaskStatusSuccess && taskFailReasonIsLegacyResultURL(task.FailReason) {
 		failReason = ""
 	}
+	if failReason != "" && service.ResolveUserRole(c) < common.RoleAdminUser {
+		failReason = model.NewUserErrorPresentation(task.ChannelId, task.Properties.OriginModelName, task.Properties.UpstreamModelName).MaskText(failReason)
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"task_id":     task.TaskID,
 		"platform":    task.Platform,
@@ -431,7 +434,11 @@ func GetUserTask(c *gin.Context) {
 	queryParams := model.SyncTaskQueryParams{Platform: constant.TaskPlatform(c.Query("platform")), TaskID: c.Query("task_id"), Status: c.Query("status"), Action: c.Query("action"), StartTimestamp: startTimestamp, EndTimestamp: endTimestamp}
 	items := model.TaskGetAllUserTask(userID, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), queryParams)
 	pageInfo.SetTotal(int(model.TaskCountAllUserTask(userID, queryParams)))
-	pageInfo.SetItems(tasksToDto(items, false, common.RoleCommonUser))
+	taskItems := tasksToDto(items, false, service.ResolveUserRole(c))
+	for _, item := range taskItems {
+		item.ChannelId = 0
+	}
+	pageInfo.SetItems(taskItems)
 	common.ApiSuccess(c, pageInfo)
 }
 
@@ -457,6 +464,18 @@ func tasksToDto(tasks []*model.Task, fillUser bool, viewerRole int) []*dto.TaskD
 			}
 		}
 		item := relay.TaskModel2Dto(task)
+		if viewerRole < common.RoleAdminUser && item.FailReason != "" {
+			item.FailReason = model.NewUserErrorPresentation(task.ChannelId, task.Properties.OriginModelName, task.Properties.UpstreamModelName).MaskText(item.FailReason)
+		}
+
+		if viewerRole < common.RoleAdminUser && task.Properties.UpstreamModelName != "" {
+			if displayName := model.UserModelDisplayName(task.ChannelId, task.Properties.OriginModelName); displayName != "" {
+				properties := task.Properties
+				properties.UpstreamModelName = displayName
+				item.Properties = properties
+			}
+		}
+
 		item.LegacyVideoAvailable = legacyVideoAvailable(task)
 		item.ResultDiscarded = task.PrivateData.ResultDiscarded
 		if task.Status == model.TaskStatusSuccess {

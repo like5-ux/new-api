@@ -75,6 +75,28 @@ type ModelSummary struct {
 	RequestCount        int64              `json:"-"`
 }
 
+type RollingBucketPoint struct {
+	Ts           int64   `json:"ts"`
+	RequestCount int64   `json:"request_count"`
+	SuccessCount int64   `json:"success_count"`
+	AvgLatencyMs int64   `json:"avg_latency_ms"`
+	SuccessRate  float64 `json:"success_rate"`
+	AvgTps       float64 `json:"avg_tps"`
+}
+
+type RollingModelSummary struct {
+	ModelSummary
+	SuccessCount int64                `json:"success_count"`
+	Series       []RollingBucketPoint `json:"series"`
+}
+
+type RollingSummaryResult struct {
+	Summary     *Summary              `json:"summary"`
+	WindowStart int64                 `json:"window_start"`
+	WindowEnd   int64                 `json:"window_end"`
+	Models      []RollingModelSummary `json:"models"`
+}
+
 type SummaryAllResult struct {
 	Summary     *Summary       `json:"summary"`
 	WindowStart int64          `json:"window_start"`

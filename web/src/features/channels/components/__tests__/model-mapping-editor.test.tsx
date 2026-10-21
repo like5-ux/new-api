@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { act, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { createInstance } from 'i18next'
+import { useState } from 'react'
 import { I18nextProvider } from 'react-i18next'
 import { expect, test, vi } from 'vitest'
 
@@ -259,4 +260,106 @@ test('commit fires once an edit settles on Enter or when focus leaves, not per k
   expect(onCommit).toHaveBeenCalledTimes(1)
   await user.click(screen.getByRole('button', { name: 'outside' }))
   expect(onCommit).toHaveBeenCalledTimes(2)
+})
+
+function DisplayMappingHarness(props: { disabled?: boolean }) {
+  const [mapping, setMapping] = useState('{"alias":"provider-model"}')
+  const [displayNames, setDisplayNames] = useState<Record<string, string>>({
+    alias: 'friendly-model',
+  })
+  return (
+    <>
+      <ModelMappingEditor
+        value={mapping}
+        onChange={setMapping}
+        userModelMapping={displayNames}
+        onUserModelMappingChange={setDisplayNames}
+        disabled={props.disabled}
+      />
+      <output aria-label='display-settings'>
+        {JSON.stringify(displayNames)}
+      </output>
+    </>
+  )
+}
+
+test('each mapping has an optional user display name that preserves the actual request and upstream models', async () => {
+  const user = userEvent.setup()
+  render(<DisplayMappingHarness />)
+  const display = screen.getByRole('textbox', {
+    name: 'User-facing Model Name',
+  })
+  expect(display).toHaveValue('friendly-model')
+  await user.clear(display)
+  await user.type(display, 'new-display')
+  expect(
+    screen.getByRole('combobox', { name: 'Request Model Name' })
+  ).toHaveValue('alias')
+  expect(
+    screen.getByRole('combobox', { name: 'Upstream Model Name' })
+  ).toHaveValue('provider-model')
+  expect(screen.getByLabelText('display-settings')).toHaveTextContent(
+    '{"alias":"new-display"}'
+  )
+  await user.click(screen.getByRole('tab', { name: 'JSON' }))
+  expect(screen.getByRole('textbox', { name: 'Model Mapping' })).toHaveValue(
+    JSON.stringify({ alias: 'provider-model' }, null, 2)
+  )
+  await user.click(screen.getByRole('tab', { name: 'Visual' }))
+  expect(
+    screen.getByRole('textbox', { name: 'User-facing Model Name' })
+  ).toHaveValue('new-display')
+  await user.clear(
+    screen.getByRole('textbox', { name: 'User-facing Model Name' })
+  )
+  expect(screen.getByLabelText('display-settings')).toHaveTextContent('{}')
+})
+
+test('renaming and deleting a mapping move and remove its user display name', async () => {
+  const user = userEvent.setup()
+  render(<DisplayMappingHarness />)
+  await user.type(
+    screen.getByRole('combobox', { name: 'Request Model Name' }),
+    '-renamed'
+  )
+  expect(
+    screen.getByRole('textbox', { name: 'User-facing Model Name' })
+  ).toHaveValue('friendly-model')
+  expect(screen.getByLabelText('display-settings')).toHaveTextContent(
+    '{"alias-renamed":"friendly-model"}'
+  )
+  await user.click(screen.getByRole('button', { name: 'Delete mapping' }))
+  expect(screen.getByLabelText('display-settings')).toHaveTextContent('{}')
+})
+
+test('disabled mapping controls also disable its user display name', () => {
+  render(<DisplayMappingHarness disabled />)
+  expect(
+    screen.getByRole('textbox', { name: 'User-facing Model Name' })
+  ).toBeDisabled()
+})
+
+test('a blank user display name explains that the original model names are preserved', () => {
+  render(
+    <ModelMappingEditor
+      value='{"alias":"provider-model"}'
+      onChange={vi.fn()}
+      userModelMapping={{}}
+      onUserModelMappingChange={vi.fn()}
+    />
+  )
+  const display = screen.getByRole('textbox', {
+    name: 'User-facing Model Name',
+  })
+  expect(display).toHaveValue('')
+  expect(display).toHaveAttribute(
+    'placeholder',
+    'Leave blank to keep original model names'
+  )
+  expect(
+    screen.getByRole('combobox', { name: 'Request Model Name' })
+  ).toHaveValue('alias')
+  expect(
+    screen.getByRole('combobox', { name: 'Upstream Model Name' })
+  ).toHaveValue('provider-model')
 })

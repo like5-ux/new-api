@@ -13,6 +13,7 @@ func flushLoop() {
 	for {
 		interval := perf_metrics_setting.GetFlushIntervalMinutes()
 		time.Sleep(time.Duration(interval) * time.Minute)
+		cleanupRollingBuckets()
 		setting := perf_metrics_setting.GetSetting()
 		if !setting.Enabled {
 			continue
@@ -64,6 +65,16 @@ func deleteOldEmptyBucket(k bucketKey, rawKey any) {
 	if k.bucketTs < bucketStart(time.Now().Add(-24*time.Hour).Unix()) {
 		hotBuckets.Delete(rawKey)
 	}
+}
+
+func cleanupRollingBuckets() {
+	cutoff := minuteStart(time.Now().Unix()) - rollingWindowMinutes*60
+	rollingBuckets.Range(func(key, _ any) bool {
+		if key.(bucketKey).bucketTs < cutoff {
+			rollingBuckets.Delete(key)
+		}
+		return true
+	})
 }
 
 func cleanupExpiredMetrics(retentionDays int) {
