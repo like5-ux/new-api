@@ -1,9 +1,12 @@
-name: Build dev image (fork)
+name: Build fork images
 
 on:
   push:
     branches:
       - dev
+      - main
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -25,15 +28,27 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      channel_tag: ${{ steps.version.outputs.channel_tag }}
       sha: ${{ steps.version.outputs.sha }}
     steps:
       - name: Resolve version from commit
         id: version
         run: |
           SHORT_SHA=${GITHUB_SHA::7}
-          echo "version=dev-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="$GITHUB_REF_NAME"
+            CHANNEL_TAG="latest"
+          elif [[ "$GITHUB_REF_NAME" == "main" ]]; then
+            VERSION="main-${SHORT_SHA}"
+            CHANNEL_TAG="main"
+          else
+            VERSION="dev-${SHORT_SHA}"
+            CHANNEL_TAG="dev"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "channel_tag=${CHANNEL_TAG}" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Building dev-${SHORT_SHA} from ${GITHUB_SHA}"
+          echo "Building ${VERSION} and ${CHANNEL_TAG} from ${GITHUB_SHA}"
 
   verify:
     name: Build whole repository
@@ -153,7 +168,7 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-${{ matrix.arch }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.channel_tag }}-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
@@ -189,13 +204,13 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-amd64" \
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-arm64"
           docker buildx imagetools create \
-            -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev" \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-amd64" \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev-arm64"
+            -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.channel_tag }}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.channel_tag }}-amd64" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.channel_tag }}-arm64"
 
       - name: Publish manifest summary
         run: |
           echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev" >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.channel_tag }}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
